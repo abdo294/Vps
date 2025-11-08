@@ -1,0 +1,109 @@
+name: Unlimited RDP
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+jobs:
+  infinite-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 0
+    
+    steps:
+    - name: Configure Unlimited RDP
+      run: |
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+        
+        netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+        netsh advfirewall firewall add rule name="Unlimited-RDP" dir=in action=allow protocol=TCP localport=3389
+        
+        powercfg -change -standby-timeout-ac 0
+        powercfg -change -hibernate-timeout-ac 0
+        
+        Restart-Service -Name TermService -Force
+
+    - name: Create RDP User
+      run: |
+        $password = "admin@123"
+        $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+        if (-not (Get-LocalUser -Name "TOOLBOXLAP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "TOOLBOXLAP" -Password $securePass -AccountNeverExpires
+        }
+
+        Add-LocalGroupMember -Group "Administrators" -Member "TOOLBOXLAP"
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TOOLBOXLAP"
+
+        echo "RDP_CREDS=User: TOOLBOXLAP | Password: $password" >> $env:GITHUB_ENV
+
+    - name: Install Tailscale
+      run: |
+        $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+        $installerPath = "$env:TEMP\tailscale.msi"
+
+        Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+        Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+        Remove-Item $installerPath -Force
+
+    - name: Start Tailscale Connection
+      run: |
+        Start-Sleep -Seconds 10
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+        
+        $tsIP = $null
+        $retries = 0
+        while (-not $tsIP -and $retries -lt 15) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Start-Sleep -Seconds 5
+            $retries++
+        }
+        
+        if (-not $tsIP) {
+            $tsIP = "check-tailscale-status"
+        }
+        
+        echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+    - name: Verify RDP
+      run: |
+        Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+        $testResult = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
+        if ($testResult.TcpTestSucceeded) {
+            Write-Host "RDP Port 3389 is open and listening"
+        } else {
+            Write-Host "RDP configuration in progress..."
+        }
+
+    - name: Unlimited RDP Session
+      run: |
+        Write-Host "=== UNLIMITED RDP ACCESS ==="
+        Write-Host "Address: $env:TAILSCALE_IP"
+        Write-Host "Username: TOOLBOXLAP"
+        Write-Host "Password: admin@123"
+        Write-Host "============================="
+        
+        # نظام المراقبة المستمر
+        $sessionCount = 0
+        while ($true) {
+            $sessionCount++
+            $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            
+            # فحص حالة الخدمات
+            $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+            $tailscaleStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>$null
+            
+            Write-Host "[$currentTime] Session Active - Run #$sessionCount"
+            Write-Host "   RDP Service: $($rdpService.Status)"
+            Write-Host "   Tailscale: $($tailscaleStatus -replace '\n', ' ')"
+            
+            # إصلاح تلقائي إذا توقفت الخدمة
+            if ($rdpService.Status -ne 'Running') {
+                Write-Host "   Restarting RDP Service..."
+
+Start-Service -Name TermService -ErrorAction SilentlyContinue
+            }
+            
+            Start-Sleep -Seconds 300
+        }
